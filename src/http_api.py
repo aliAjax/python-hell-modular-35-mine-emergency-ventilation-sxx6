@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .domain import (
     Actor,
+    BatchRejectedError,
     ConflictError,
     DomainError,
     InvalidTransition,
@@ -70,7 +71,10 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            if isinstance(exc, BatchRejectedError):
+                payload["rejected"] = exc.rejected
+            self._send(status, payload)
 
         def do_GET(self):
             try:

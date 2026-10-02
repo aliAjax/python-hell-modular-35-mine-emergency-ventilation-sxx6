@@ -43,6 +43,11 @@ class WorkflowTest(unittest.TestCase):
 
         vent = self.create("ventilation", {"name": "fan-1", "area_code": "M-01", "capacity": 100})
         vent = self.act(vent, "stop", {})
+        # The fan cannot resume while the area sensor is still alarming.
+        from src.domain import ConflictError
+        with self.assertRaises(ConflictError):
+            self.act(vent, "restore", {"tested_at": "2026-09-27T11:00:00Z"})
+        sensor = self.act(sensor, "clear")
         vent = self.act(vent, "restore", {"tested_at": "2026-09-27T11:00:00Z"})
         self.assertEqual(vent["status"], "running")
 

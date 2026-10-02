@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -18,6 +19,20 @@ class SQLiteRepository:
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         return connection
+
+    @contextmanager
+    def transaction(self):
+        """Run a unit of work in a single committed transaction."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _initialize(self):
         with self._connect() as connection:
@@ -69,25 +84,52 @@ class SQLiteRepository:
             "updated_at": row["updated_at"],
         }
 
-    def create_entity(self, entity_id, kind, status, data, actor_id):
+    def create_entity(self, entity_id, kind, status, data, actor_id, connection=None):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
+        own = connection is None
+        connection = connection or self._connect()
+        try:
             connection.execute(
                 "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
                 "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
                 (entity_id, kind, status, payload, actor_id, now, now),
             )
+            if own:
+                connection.commit()
+        except Exception:
+            if own:
+                connection.rollback()
+            raise
+        finally:
+            if own:
+                connection.close()
+        if not own:
+            return {
+                "id": entity_id,
+                "kind": kind,
+                "status": status,
+                "version": 1,
+                "data": json.loads(payload),
+                "created_by": actor_id,
+                "created_at": now,
+                "updated_at": now,
+            }
         return self.get_entity(entity_id)
 
-    def get_entity(self, entity_id):
-        with self._connect() as connection:
+    def get_entity(self, entity_id, connection=None):
+        own = connection is None
+        connection = connection or self._connect()
+        try:
             row = connection.execute(
                 "SELECT * FROM entities WHERE id = ?", (entity_id,)
             ).fetchone()
+        finally:
+            if own:
+                connection.close()
         return self._entity_from_row(row) if row else None
 
-    def list_entities(self, kind=None, status=None):
+    def list_entities(self, kind=None, status=None, connection=None):
         clauses = []
         params = []
         if kind:
@@ -97,14 +139,19 @@ class SQLiteRepository:
             clauses.append("status = ?")
             params.append(status)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        with self._connect() as connection:
+        own = connection is None
+        connection = connection or self._connect()
+        try:
             rows = connection.execute(
                 "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
             ).fetchall()
+        finally:
+            if own:
+                connection.close()
         return [self._entity_from_row(row) for row in rows]
 
-    def find_entities(self, kind, field, value):
-        entities = self.list_entities(kind=kind)
+    def find_entities(self, kind, field, value, connection=None):
+        entities = self.list_entities(kind=kind, connection=connection)
         if field == "*":
             return entities
         return [
@@ -113,12 +160,14 @@ class SQLiteRepository:
             if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
         ]
 
-    def update_entity(self, entity_id, expected_version, status, data):
+    def update_entity(self, entity_id, expected_version, status, data, connection=None):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        connection = self._connect()
+        own = connection is None
+        connection = connection or self._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            if own:
+                connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT version FROM entities WHERE id = ?", (entity_id,)
             ).fetchone()
@@ -135,16 +184,35 @@ class SQLiteRepository:
                 "WHERE id = ? AND version = ?",
                 (status, payload, now, entity_id, current_version),
             )
-            connection.commit()
+            if own:
+                connection.commit()
         except Exception:
-            connection.rollback()
+            if own:
+                connection.rollback()
             raise
         finally:
-            connection.close()
+            if own:
+                connection.close()
+        if not own:
+            row = connection.execute(
+                "SELECT kind, created_by, created_at FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            return {
+                "id": entity_id,
+                "kind": row["kind"],
+                "status": status,
+                "version": current_version + 1,
+                "data": json.loads(payload),
+                "created_by": row["created_by"],
+                "created_at": row["created_at"],
+                "updated_at": now,
+            }
         return self.get_entity(entity_id)
 
-    def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
-        with self._connect() as connection:
+    def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail, connection=None):
+        own = connection is None
+        connection = connection or self._connect()
+        try:
             connection.execute(
                 "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -159,6 +227,15 @@ class SQLiteRepository:
                     utcnow(),
                 ),
             )
+            if own:
+                connection.commit()
+        except Exception:
+            if own:
+                connection.rollback()
+            raise
+        finally:
+            if own:
+                connection.close()
 
     def list_audit(self, entity_id=None):
         with self._connect() as connection:

@@ -2,6 +2,43 @@ from datetime import datetime, timedelta
 
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
+WORKER_WITHDRAWN_STATUSES = ("evacuated", "rescued", "inactive")
+WORKER_OUT_OF_MINE_STATUSES = ("missing", "located") + WORKER_WITHDRAWN_STATUSES
+
+
+def compute_sensor_severity(gas_ppm, threshold_ppm):
+    gas_ppm = float(gas_ppm)
+    threshold_ppm = float(threshold_ppm)
+    if gas_ppm >= threshold_ppm * 1.5:
+        return "alarm"
+    if gas_ppm >= threshold_ppm:
+        return "warning"
+    return "normal"
+
+
+def area_restore_blockers(lookup, area_code):
+    """Shared gate: a fan may only resume with no alarming sensors and no one left in its area."""
+    blockers = {}
+    alarms = sorted(
+        sensor["id"]
+        for sensor in _all(lookup, "sensor")
+        if sensor["data"].get("location_code") == area_code and sensor["status"] == "alarm"
+    )
+    if alarms:
+        blockers["alarming_sensor_ids"] = alarms
+    worker_ids = {
+        worker["id"]
+        for worker in _all(lookup, "worker")
+        if worker["data"].get("location_code") == area_code
+        and worker["status"] not in WORKER_WITHDRAWN_STATUSES
+    }
+    for refuge in _all(lookup, "refuge"):
+        if refuge["data"].get("location_code") == area_code:
+            worker_ids.update(refuge["data"].get("occupants", []))
+    if worker_ids:
+        blockers["worker_ids"] = sorted(worker_ids)
+    return blockers
+
 
 def _require(data, fields):
     for field in fields:
@@ -41,12 +78,23 @@ def _validate_sensor(data):
     threshold = _number(data.get("threshold_ppm"), "threshold_ppm")
     if gas < 0 or threshold <= 0:
         raise ValidationError("gas readings and thresholds must be positive")
-    data["severity"] = "alarm" if gas >= threshold * 1.5 else "warning" if gas >= threshold else "normal"
+    data["severity"] = compute_sensor_severity(gas, threshold)
 
 
 def _validate_capacity(data, field):
     if _number(data.get(field), field) <= 0:
         raise ValidationError(field + " must be positive")
+
+
+def _validate_refuge(data):
+    _validate_capacity(data, "capacity")
+    occupants = data.get("occupants")
+    if occupants is None:
+        data["occupants"] = []
+    elif not isinstance(occupants, list):
+        raise ValidationError("occupants must be a list of worker ids")
+    if len(data["occupants"]) > _number(data.get("capacity"), "capacity"):
+        raise ValidationError("occupants exceed refuge capacity")
 
 
 def _validate_passage(data):
@@ -88,6 +136,35 @@ def _sensor_alarm(actor, entity, data, lookup):
     return {"acknowledged_by": actor.user_id}
 
 
+def _refuge_occupy(actor, entity, data, lookup):
+    worker_id = str(data.get("worker_id", "")).strip()
+    occupants = list(entity["data"].get("occupants", []))
+    if worker_id in occupants:
+        raise ConflictError("worker already inside refuge: " + worker_id)
+    capacity = int(entity["data"].get("capacity", 0))
+    if len(occupants) + 1 > capacity:
+        raise ConflictError("refuge %s is at capacity (%d)" % (entity["id"], capacity))
+    occupants.append(worker_id)
+    return {"occupants": occupants}
+
+
+def _refuge_release(actor, entity, data, lookup):
+    worker_id = str(data.get("worker_id", "")).strip()
+    occupants = list(entity["data"].get("occupants", []))
+    if worker_id not in occupants:
+        raise ConflictError("worker is not inside refuge: " + worker_id)
+    occupants.remove(worker_id)
+    next_status = "available" if not occupants else "occupied"
+    return {"occupants": occupants}, next_status
+
+
+def _restore_ventilation(actor, entity, data, lookup):
+    blockers = area_restore_blockers(lookup, entity["data"].get("area_code"))
+    if blockers:
+        raise ConflictError("ventilation area is not clear: " + str(blockers))
+    return {"restored_by": actor.user_id}
+
+
 def _complete_task(actor, entity, data, lookup):
     if not str(data.get("result", "")).strip():
         raise ValidationError("result is required")
@@ -102,6 +179,18 @@ def _close_incident(actor, entity, data, lookup):
         raise ConflictError("cannot close incident while tasks remain active")
     if [v for v in _all(lookup, "ventilation") if v["status"] != "running"]:
         raise ConflictError("cannot close incident until ventilation is restored")
+    occupied = [r for r in _all(lookup, "refuge") if r["data"].get("occupants")]
+    if occupied:
+        raise ConflictError(
+            "cannot close incident while refuges are occupied: "
+            + ", ".join(sorted(r["id"] for r in occupied))
+        )
+    over = [
+        r["id"] for r in _all(lookup, "refuge")
+        if len(r["data"].get("occupants", [])) > int(r["data"].get("capacity", 0))
+    ]
+    if over:
+        raise ConflictError("cannot close incident while refuges exceed capacity: " + ", ".join(sorted(over)))
     return {"closed_by": actor.user_id}
 
 
@@ -143,8 +232,8 @@ class RuleEngine:
             "clear": (("blocked", "restricted"), "open"),
         },
         "refuge": {
-            "occupy": (("available",), "occupied"),
-            "release": (("occupied",), "available"),
+            "occupy": (("available", "occupied"), "occupied"),
+            "release": (("occupied",), "occupied"),
             "maintain": (("available",), "maintenance"),
             "reopen": (("maintenance",), "available"),
         },
@@ -181,6 +270,8 @@ class RuleEngine:
         ("incident", "close"): ("summary",),
         ("task", "complete"): ("result",),
         ("task", "cancel"): ("reason",),
+        ("refuge", "occupy"): ("worker_id",),
+        ("refuge", "release"): ("worker_id",),
     }
     CREATE_ROLES = {
         "worker": ("admin", "safety", "dispatcher"),
@@ -229,7 +320,7 @@ class RuleEngine:
         "sensor": lambda a, d, l: _validate_sensor(d),
         "ventilation": lambda a, d, l: _validate_capacity(d, "capacity"),
         "passage": lambda a, d, l: _validate_passage(d),
-        "refuge": lambda a, d, l: _validate_capacity(d, "capacity"),
+        "refuge": lambda a, d, l: _validate_refuge(d),
         "incident": lambda a, d, l: _validate_incident(d),
         "task": lambda a, d, l: _validate_task(d, l),
         "offline_record": lambda a, d, l: _validate_offline(d),
@@ -238,6 +329,9 @@ class RuleEngine:
         ("sensor", "raise_alarm"): _sensor_alarm,
         ("incident", "close"): _close_incident,
         ("task", "complete"): _complete_task,
+        ("ventilation", "restore"): _restore_ventilation,
+        ("refuge", "occupy"): _refuge_occupy,
+        ("refuge", "release"): _refuge_release,
     }
 
     def normalize_kind(self, kind):
@@ -247,6 +341,8 @@ class RuleEngine:
         kind = self.normalize_kind(kind)
         if kind not in self.INITIAL_STATUS:
             raise ValidationError("unknown kind: " + str(kind))
+        if kind == "refuge" and data and data.get("occupants"):
+            return "occupied"
         return self.INITIAL_STATUS[kind]
 
     def validate_create(self, actor, kind, data, lookup=None):
@@ -273,7 +369,10 @@ class RuleEngine:
         _require(data, self.ACTION_REQUIRED.get((kind, action), ()))
         custom = self.CUSTOM_TRANSITIONS.get((kind, action))
         extra = custom(actor, entity, data, lookup) if custom else {}
+        next_status_override = None
+        if isinstance(extra, tuple):
+            extra, next_status_override = extra
         patch = dict(data)
         if extra:
             patch.update(extra)
-        return next_status, patch
+        return next_status_override or next_status, patch

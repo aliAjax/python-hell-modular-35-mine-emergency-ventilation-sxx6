@@ -23,6 +23,14 @@ class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
 
+class BatchRejectedError(ConflictError):
+    """An offline batch conflicts with central state; the whole batch is rejected."""
+
+    def __init__(self, rejected):
+        self.rejected = rejected
+        super().__init__("offline batch rejected: %d record(s) in conflict" % len(rejected))
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
