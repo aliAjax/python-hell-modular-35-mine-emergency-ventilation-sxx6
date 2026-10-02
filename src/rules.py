@@ -31,6 +31,17 @@ def _number(value, field):
         raise ValidationError(field + " must be numeric")
 
 
+def severity_for(gas_ppm, threshold_ppm):
+    """Compute sensor severity from a gas reading and its threshold."""
+    gas = _number(gas_ppm, "gas_ppm")
+    threshold = _number(threshold_ppm, "threshold_ppm")
+    if gas >= threshold * 1.5:
+        return "alarm"
+    if gas >= threshold:
+        return "warning"
+    return "normal"
+
+
 def _validate_worker(data):
     if len(str(data.get("name", "")).strip()) < 2:
         raise ValidationError("worker name is too short")
@@ -41,7 +52,7 @@ def _validate_sensor(data):
     threshold = _number(data.get("threshold_ppm"), "threshold_ppm")
     if gas < 0 or threshold <= 0:
         raise ValidationError("gas readings and thresholds must be positive")
-    data["severity"] = "alarm" if gas >= threshold * 1.5 else "warning" if gas >= threshold else "normal"
+    data["severity"] = severity_for(gas, threshold)
 
 
 def _validate_capacity(data, field):
@@ -102,7 +113,37 @@ def _close_incident(actor, entity, data, lookup):
         raise ConflictError("cannot close incident while tasks remain active")
     if [v for v in _all(lookup, "ventilation") if v["status"] != "running"]:
         raise ConflictError("cannot close incident until ventilation is restored")
+    area = entity["data"].get("area_code")
+    for refuge in _all(lookup, "refuge"):
+        if (
+            refuge["data"].get("location_code") == area
+            and int(refuge["data"].get("occupancy", 0)) > int(refuge["data"].get("capacity", 0))
+        ):
+            raise ConflictError(
+                "cannot close incident: refuge %s is over capacity in %s" % (refuge["id"], area)
+            )
     return {"closed_by": actor.user_id}
+
+
+def _restore_ventilation(actor, entity, data, lookup):
+    area = entity["data"].get("area_code")
+    for sensor in _all(lookup, "sensor"):
+        if sensor["data"].get("location_code") == area and sensor["status"] == "alarm":
+            raise ConflictError(
+                "cannot restore ventilation %s: sensor %s is still alarming in %s"
+                % (entity["id"], sensor["id"], area)
+            )
+    for worker in _all(lookup, "worker"):
+        if worker["data"].get("location_code") == area and worker["status"] not in (
+            "evacuated",
+            "rescued",
+            "inactive",
+        ):
+            raise ConflictError(
+                "cannot restore ventilation %s: worker %s has not evacuated from %s"
+                % (entity["id"], worker["id"], area)
+            )
+    return {"restored_by": actor.user_id}
 
 
 class RuleEngine:
@@ -236,6 +277,7 @@ class RuleEngine:
     }
     CUSTOM_TRANSITIONS = {
         ("sensor", "raise_alarm"): _sensor_alarm,
+        ("ventilation", "restore"): _restore_ventilation,
         ("incident", "close"): _close_incident,
         ("task", "complete"): _complete_task,
     }

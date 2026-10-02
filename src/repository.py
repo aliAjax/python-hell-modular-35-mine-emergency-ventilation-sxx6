@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 
 
 def utcnow():
@@ -198,6 +198,75 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def apply_batch(self, operations):
+        """Apply a list of create/update/audit operations atomically.
+
+        Each operation is a dict with a ``type`` of ``create``, ``update`` or
+        ``audit``. Used by the offline merge so a rejected batch writes nothing.
+        """
+        with self._connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                for op in operations:
+                    if op["type"] == "create":
+                        connection.execute(
+                            "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                            "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+                            (
+                                op["id"],
+                                op["kind"],
+                                op["status"],
+                                json.dumps(op["data"], ensure_ascii=False, sort_keys=True),
+                                op["actor_id"],
+                                utcnow(),
+                                utcnow(),
+                            ),
+                        )
+                    elif op["type"] == "update":
+                        row = connection.execute(
+                            "SELECT version FROM entities WHERE id = ?", (op["id"],)
+                        ).fetchone()
+                        if not row:
+                            raise NotFoundError("entity not found: " + op["id"])
+                        current = int(row["version"])
+                        if op.get("expected_version") is not None and current != int(op["expected_version"]):
+                            raise ConflictError(
+                                "version conflict: expected %s, found %s"
+                                % (op["expected_version"], current)
+                            )
+                        connection.execute(
+                            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                            "WHERE id = ? AND version = ?",
+                            (
+                                op["status"],
+                                json.dumps(op["data"], ensure_ascii=False, sort_keys=True),
+                                utcnow(),
+                                op["id"],
+                                current,
+                            ),
+                        )
+                    elif op["type"] == "audit":
+                        connection.execute(
+                            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                op["entity_id"],
+                                op["actor_id"],
+                                op["actor_role"],
+                                op["action"],
+                                op.get("from_status"),
+                                op["to_status"],
+                                json.dumps(op.get("detail", {}), ensure_ascii=False, sort_keys=True),
+                                utcnow(),
+                            ),
+                        )
+                    else:
+                        raise ValidationError("unknown batch operation: " + str(op["type"]))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def ping(self):
         with self._connect() as connection:

@@ -23,6 +23,26 @@ class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
 
+class OfflineMergeError(ConflictError):
+    """A batch of offline records could not be merged.
+
+    ``conflicts`` lists records that press against current center state;
+    ``rejected_capacity`` describes the refuge whose capacity would be exceeded.
+    The whole batch is rejected, so nothing is written.
+    """
+
+    def __init__(self, message, conflicts=None, rejected_capacity=None):
+        super().__init__(message)
+        self.conflicts = conflicts or []
+        self.rejected_capacity = rejected_capacity
+        details = {}
+        if self.conflicts:
+            details["conflicts"] = self.conflicts
+        if self.rejected_capacity:
+            details["rejected_capacity"] = self.rejected_capacity
+        self.details = details
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 

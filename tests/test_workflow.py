@@ -43,6 +43,9 @@ class WorkflowTest(unittest.TestCase):
 
         vent = self.create("ventilation", {"name": "fan-1", "area_code": "M-01", "capacity": 100})
         vent = self.act(vent, "stop", {})
+        # Gas must clear and people must be out before ventilation is restored.
+        sensor = self.act(sensor, "clear")
+        self.assertEqual(sensor["status"], "normal")
         vent = self.act(vent, "restore", {"tested_at": "2026-09-27T11:00:00Z"})
         self.assertEqual(vent["status"], "running")
 
